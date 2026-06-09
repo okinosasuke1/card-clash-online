@@ -2,6 +2,7 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const path = require("path");
+const fs = require("fs");
 
 const PORT = process.env.PORT || 3000;
 const TURN_SECONDS = 15;
@@ -27,8 +28,25 @@ const SKILLS = {
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+const publicDir = path.join(__dirname, "public");
+const rootIndex = path.join(__dirname, "index.html");
+const publicIndex = path.join(publicDir, "index.html");
+const indexFile = fs.existsSync(publicIndex) ? publicIndex : rootIndex;
 
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(publicDir));
+app.use(express.static(__dirname));
+
+app.get("/", (req, res) => {
+  if (!fs.existsSync(indexFile)) {
+    res.status(404).send("CARD CLASH index.html not found");
+    return;
+  }
+  res.sendFile(indexFile);
+});
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true, app: "card-clash-online" });
+});
 
 const waiting = [];
 const rooms = new Map();
