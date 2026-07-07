@@ -324,6 +324,7 @@ async function processOrderWebhook(order, topic, shopDomain) {
     ghnCreatedAt: existing.ghnCreatedAt || new Date().toISOString()
   };
   writeJson(PROCESSED_FILE, processed);
+  console.log(`${new Date().toISOString()} processed ${orderName} with GHN ${ghnOrderCode}`);
 
   if (!config.updateShopifyFulfillment) {
     return { ok: true, order: orderName, ghnOrderCode, trackingUrl, shopifyUpdated: false };
@@ -337,6 +338,7 @@ async function processOrderWebhook(order, topic, shopDomain) {
     shopifyUpdatedAt: new Date().toISOString()
   };
   writeJson(PROCESSED_FILE, processed);
+  console.log(`${new Date().toISOString()} updated Shopify fulfillment for ${orderName} with GHN ${ghnOrderCode}`);
 
   return {
     ok: true,
@@ -464,27 +466,62 @@ async function resolveRecipientAddress(shippingAddress) {
     query: { province_id: province.ProvinceID }
   });
   const district = findBestMatch(districts.data || [], 'DistrictName', candidates, 'district');
-  if (!district) {
-    throw permanentError(`Khong tim duoc quan/huyen GHN tu dia chi: ${candidates.join(' | ')}`);
+  if (district) {
+    const resolved = await resolveWardForDistrict(district, candidates);
+    if (resolved) {
+      return {
+        provinceId: province.ProvinceID,
+        provinceName: province.ProvinceName,
+        districtId: resolved.district.DistrictID,
+        districtName: resolved.district.DistrictName,
+        wardCode: String(resolved.ward.WardCode),
+        wardName: resolved.ward.WardName
+      };
+    }
   }
 
-  const wards = await ghnRequest('/shiip/public-api/master-data/ward', {
-    method: 'GET',
-    query: { district_id: district.DistrictID }
-  });
-  const ward = findBestMatch(wards.data || [], 'WardName', candidates, 'ward');
-  if (!ward) {
-    throw permanentError(`Khong tim duoc phuong/xa GHN tu dia chi: ${candidates.join(' | ')}`);
+  const inferred = await findWardAcrossDistricts(districts.data || [], candidates);
+  if (!inferred) {
+    throw permanentError(`Khong tim duoc quan/phuong GHN tu dia chi, hay them quan/huyen vao dia chi: ${candidates.join(' | ')}`);
   }
 
   return {
     provinceId: province.ProvinceID,
     provinceName: province.ProvinceName,
-    districtId: district.DistrictID,
-    districtName: district.DistrictName,
-    wardCode: String(ward.WardCode),
-    wardName: ward.WardName
+    districtId: inferred.district.DistrictID,
+    districtName: inferred.district.DistrictName,
+    wardCode: String(inferred.ward.WardCode),
+    wardName: inferred.ward.WardName
   };
+}
+
+async function resolveWardForDistrict(district, candidates) {
+  const wards = await ghnRequest('/shiip/public-api/master-data/ward', {
+    method: 'GET',
+    query: { district_id: district.DistrictID }
+  });
+  const ward = findBestMatch(wards.data || [], 'WardName', candidates, 'ward');
+  return ward ? { district, ward } : null;
+}
+
+async function findWardAcrossDistricts(districts, candidates) {
+  const matches = [];
+
+  for (const district of districts) {
+    const wards = await ghnRequest('/shiip/public-api/master-data/ward', {
+      method: 'GET',
+      query: { district_id: district.DistrictID }
+    });
+    const match = findBestMatchWithScore(wards.data || [], 'WardName', candidates, 'ward');
+    if (match.best && match.bestScore >= 80) {
+      matches.push({ district, ward: match.best, score: match.bestScore });
+    }
+  }
+
+  matches.sort((a, b) => b.score - a.score);
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1 && matches[0].score > matches[1].score) return matches[0];
+  return null;
 }
 
 async function createShopifyFulfillment(orderGid, ghnOrderCode, trackingUrl, shopDomain) {
@@ -744,6 +781,11 @@ function buildGhnItems(order) {
 }
 
 function findBestMatch(list, field, candidates, level) {
+  const match = findBestMatchWithScore(list, field, candidates, level);
+  return match.bestScore >= 40 ? match.best : null;
+}
+
+function findBestMatchWithScore(list, field, candidates, level) {
   let best = null;
   let bestScore = 0;
 
@@ -758,7 +800,7 @@ function findBestMatch(list, field, candidates, level) {
     }
   }
 
-  return bestScore >= 40 ? best : null;
+  return { best, bestScore };
 }
 
 function matchScore(targetName, candidate, level) {
@@ -771,6 +813,15 @@ function matchScore(targetName, candidate, level) {
   if (candidateFull === targetFull) return 100;
   if (candidateFull.includes(targetFull)) return 90;
 
+  if (level === 'district' && /^\d+$/.test(targetSimple)) {
+    const signals = [
+      `quan ${targetSimple}`,
+      `q ${targetSimple}`,
+      `district ${targetSimple}`
+    ];
+    return signals.some((signal) => candidateFull.includes(signal)) ? 85 : 0;
+  }
+
   if (level === 'ward' && /^\d+$/.test(targetSimple)) {
     const signals = [
       `phuong ${targetSimple}`,
@@ -782,8 +833,8 @@ function matchScore(targetName, candidate, level) {
   }
 
   if (targetSimple && candidateSimple === targetSimple) return 80;
-  if (targetSimple && candidateSimple.includes(targetSimple)) return 70;
-  if (targetSimple && candidateFull.includes(targetSimple)) return 60;
+  if (targetSimple && targetSimple.length >= 3 && candidateSimple.includes(targetSimple)) return 70;
+  if (targetSimple && targetSimple.length >= 3 && candidateFull.includes(targetSimple)) return 60;
 
   return 0;
 }
