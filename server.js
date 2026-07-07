@@ -63,6 +63,34 @@ mutation FulfillmentCreate($fulfillment: FulfillmentInput!, $message: String) {
 }
 `;
 
+const TAGS_ADD_MUTATION = `
+mutation TagsAdd($id: ID!, $tags: [String!]!) {
+  tagsAdd(id: $id, tags: $tags) {
+    node {
+      id
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+`;
+
+const TAGS_REMOVE_MUTATION = `
+mutation TagsRemove($id: ID!, $tags: [String!]!) {
+  tagsRemove(id: $id, tags: $tags) {
+    node {
+      id
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+`;
+
 const config = {
   port: numberEnv('PORT', 3026),
   allowTestOrders: boolEnv('ALLOW_TEST_ORDERS', false),
@@ -93,6 +121,7 @@ const config = {
     serviceTypeId: numberEnv('GHN_SERVICE_TYPE_ID', 2),
     requiredNote: env('GHN_REQUIRED_NOTE') || 'CHOXEMHANGKHONGTHU',
     trackingUrlTemplate: env('GHN_TRACKING_URL_TEMPLATE') || 'https://donhang.ghn.vn/?order_code={order_code}',
+    webhookSecret: env('GHN_WEBHOOK_SECRET'),
     fromName: env('GHN_FROM_NAME'),
     fromPhone: env('GHN_FROM_PHONE'),
     fromAddress: env('GHN_FROM_ADDRESS'),
@@ -117,6 +146,10 @@ const config = {
   },
   address: {
     aliasesJson: env('ADDRESS_ALIASES_JSON')
+  },
+  sync: {
+    cancelGhnOnShopifyCancel: boolEnv('CANCEL_GHN_ON_SHOPIFY_CANCEL', true),
+    updateShopifyTagsFromGhn: boolEnv('UPDATE_SHOPIFY_TAGS_FROM_GHN', true)
   }
 };
 
@@ -146,6 +179,34 @@ const BUILT_IN_ADDRESS_ALIASES = {
     }
   ]
 };
+
+const GHN_STATUS_LABELS = {
+  ready_to_pick: 'San sang lay hang',
+  picking: 'Dang lay hang',
+  picked: 'Da lay hang',
+  storing: 'Dang luu kho',
+  transporting: 'Dang luan chuyen',
+  sorting: 'Dang phan loai',
+  delivering: 'Dang giao',
+  delivered: 'Giao thanh cong',
+  delivery_fail: 'Giao that bai',
+  waiting_to_return: 'Cho hoan hang',
+  return: 'Dang hoan hang',
+  return_transporting: 'Dang chuyen hoan',
+  return_sorting: 'Dang phan loai hoan',
+  returning: 'Dang tra hang',
+  return_fail: 'Tra hang that bai',
+  returned: 'Da hoan hang',
+  cancel: 'Da huy',
+  exception: 'Can xu ly',
+  damage: 'Hang hu hong',
+  lost: 'That lac',
+  money_collect_picking: 'Dang thu tien khi lay',
+  money_collect_delivering: 'Dang thu tien khi giao'
+};
+
+const GHN_STATUS_TAG_PREFIX = 'GHN: ';
+const GHN_STATUS_TAGS = Object.values(GHN_STATUS_LABELS).map((label) => `${GHN_STATUS_TAG_PREFIX}${label}`);
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -205,6 +266,23 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
+    if (req.method === 'POST' && url.pathname === '/webhooks/shopify/orders-cancelled') {
+      const rawBody = await readRequestBody(req);
+      verifyShopifyWebhook(rawBody, req.headers);
+      const order = parseJson(rawBody);
+      const shopDomain = req.headers['x-shopify-shop-domain'] || config.shopify.shopDomain;
+      const result = await processOrderCancellationWebhook(order, shopDomain);
+      return sendJson(res, 200, result);
+    }
+
+    if (req.method === 'POST' && url.pathname === '/webhooks/ghn/order-status') {
+      const rawBody = await readRequestBody(req);
+      verifyGhnWebhook(url, req.headers);
+      const body = parseJson(rawBody);
+      const result = await processGhnStatusWebhook(body);
+      return sendJson(res, 200, result);
+    }
+
     if (req.method === 'POST' && url.pathname === '/tools/resolve-address') {
       const rawBody = await readRequestBody(req);
       const body = parseJson(rawBody);
@@ -227,7 +305,34 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(config.port, () => {
   console.log(`J FORCE GHN bridge is listening on port ${config.port}`);
+  refreshRegisteredWebhooks().catch((error) => {
+    console.error(`${new Date().toISOString()} refresh webhooks failed: ${error.message}`);
+  });
 });
+
+async function refreshRegisteredWebhooks() {
+  if (!config.shopify.publicAppUrl) return;
+
+  const targets = [];
+  if (config.shopify.shopDomain) {
+    const shop = normalizeShopDomain(config.shopify.shopDomain);
+    const accessToken = shopifyAccessToken(shop);
+    if (accessToken) targets.push({ shop, accessToken });
+  }
+
+  const installations = loadJson(INSTALLATIONS_FILE, {});
+  for (const installation of Object.values(installations)) {
+    if (!installation.shop || !installation.accessToken) continue;
+    const shop = normalizeShopDomain(installation.shop);
+    if (targets.some((target) => target.shop === shop)) continue;
+    targets.push({ shop, accessToken: installation.accessToken });
+  }
+
+  for (const target of targets) {
+    await registerShopifyWebhooks(target.shop, target.accessToken);
+    console.log(`${new Date().toISOString()} Shopify webhooks ready for ${target.shop}`);
+  }
+}
 
 function startShopifyOauth(url) {
   validateShopifyOauthConfig();
@@ -348,9 +453,11 @@ async function processOrderWebhook(order, topic, shopDomain) {
   processed[orderKey] = {
     ...existing,
     orderName,
+    shopDomain: shopDomain || config.shopify.shopDomain,
     topic,
     paymentMode: paymentPlan.mode,
     codAmount: paymentPlan.codAmount,
+    clientOrderCode: clientOrderCode(order),
     ghnOrderCode,
     trackingUrl,
     ghnCreatedAt: existing.ghnCreatedAt || new Date().toISOString()
@@ -378,6 +485,120 @@ async function processOrderWebhook(order, topic, shopDomain) {
     ghnOrderCode,
     trackingUrl,
     shopifyFulfillmentId: fulfillment.id
+  };
+}
+
+async function processOrderCancellationWebhook(order, shopDomain) {
+  validateRuntimeConfig();
+
+  if (!config.sync.cancelGhnOnShopifyCancel) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'Dong bo huy van don GHN dang tat.'
+    };
+  }
+
+  if (!order || typeof order !== 'object') {
+    throw permanentError('Webhook huy don khong co du lieu don hang hop le.');
+  }
+
+  const info = shopifyOrderInfo(order);
+  const processed = loadJson(PROCESSED_FILE, {});
+  const found = findProcessedByShopifyOrder(processed, info);
+
+  if (!found?.record?.ghnOrderCode) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'Don Shopify chua co ma van don GHN de huy.',
+      order: info.orderName
+    };
+  }
+
+  if (found.record.ghnCancelledAt) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'Van don GHN da duoc ghi nhan huy truoc do.',
+      order: found.record.orderName || info.orderName,
+      ghnOrderCode: found.record.ghnOrderCode
+    };
+  }
+
+  const raw = await cancelGhnOrder(found.record.ghnOrderCode);
+  const cancelledAt = new Date().toISOString();
+  processed[found.orderKey] = {
+    ...found.record,
+    orderName: found.record.orderName || info.orderName,
+    shopDomain: found.record.shopDomain || shopDomain || config.shopify.shopDomain,
+    shopifyCancelledAt: info.cancelledAt || cancelledAt,
+    shopifyCancelReason: info.cancelReason,
+    ghnCancelledAt: cancelledAt,
+    ghnCancelRaw: raw
+  };
+  writeJson(PROCESSED_FILE, processed);
+
+  try {
+    await addShopifyTags(found.orderKey, ['GHN', 'GHN: Da huy van don'], shopDomain || found.record.shopDomain);
+  } catch (error) {
+    console.error(`${new Date().toISOString()} khong them duoc tag huy GHN cho ${info.orderName}: ${error.message}`);
+  }
+
+  console.log(`${new Date().toISOString()} cancelled GHN ${found.record.ghnOrderCode} for ${info.orderName}`);
+  return {
+    ok: true,
+    order: info.orderName,
+    ghnOrderCode: found.record.ghnOrderCode,
+    ghnCancelled: true
+  };
+}
+
+async function processGhnStatusWebhook(body) {
+  const event = normalizeGhnStatusEvent(body);
+  const processed = loadJson(PROCESSED_FILE, {});
+  const found = findProcessedByGhnOrder(processed, event);
+
+  if (!found) {
+    console.warn(`${new Date().toISOString()} GHN status webhook khong tim thay don Shopify cho ${event.orderCode || event.clientOrderCode}`);
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'Khong tim thay don Shopify da luu cho ma GHN nay.',
+      ghnOrderCode: event.orderCode,
+      clientOrderCode: event.clientOrderCode,
+      status: event.status
+    };
+  }
+
+  const statusTag = ghnStatusTag(event.status);
+  const updatedAt = new Date().toISOString();
+  const record = {
+    ...found.record,
+    ghnStatus: event.status,
+    ghnStatusLabel: event.statusLabel,
+    ghnStatusUpdatedAt: updatedAt,
+    lastGhnWebhook: event.raw
+  };
+
+  if (event.status === 'cancel') {
+    record.ghnCancelledAt = record.ghnCancelledAt || updatedAt;
+  }
+
+  processed[found.orderKey] = record;
+  writeJson(PROCESSED_FILE, processed);
+
+  if (config.sync.updateShopifyTagsFromGhn && found.orderKey.startsWith('gid://shopify/Order/')) {
+    await replaceShopifyGhnStatusTag(found.orderKey, statusTag, record.shopDomain || config.shopify.shopDomain);
+  }
+
+  console.log(`${new Date().toISOString()} GHN ${event.orderCode || event.clientOrderCode} status ${event.status} synced to ${record.orderName || found.orderKey}`);
+  return {
+    ok: true,
+    order: record.orderName,
+    ghnOrderCode: event.orderCode,
+    status: event.status,
+    tag: statusTag
   };
 }
 
@@ -434,6 +655,20 @@ async function createGhnOrder(order, paymentPlan) {
   }
 
   return { order_code: orderCode, raw: response };
+}
+
+async function cancelGhnOrder(orderCode) {
+  if (!orderCode) {
+    throw permanentError('Khong co ma van don GHN de huy.');
+  }
+
+  return ghnRequest('/shiip/public-api/v2/switch-status/cancel', {
+    method: 'POST',
+    includeShopId: true,
+    body: {
+      order_codes: [orderCode]
+    }
+  });
 }
 
 function resolvePaymentPlan(order) {
@@ -686,10 +921,51 @@ async function createShopifyFulfillment(orderGid, ghnOrderCode, trackingUrl, sho
   return response.data.fulfillmentCreate.fulfillment;
 }
 
+async function replaceShopifyGhnStatusTag(orderGid, statusTag, shopDomain) {
+  await removeShopifyTags(orderGid, GHN_STATUS_TAGS, shopDomain);
+  return addShopifyTags(orderGid, ['GHN', statusTag], shopDomain);
+}
+
+async function addShopifyTags(orderGid, tags, shopDomain) {
+  return mutateShopifyTags(TAGS_ADD_MUTATION, 'tagsAdd', orderGid, tags, shopDomain);
+}
+
+async function removeShopifyTags(orderGid, tags, shopDomain) {
+  return mutateShopifyTags(TAGS_REMOVE_MUTATION, 'tagsRemove', orderGid, tags, shopDomain);
+}
+
+async function mutateShopifyTags(mutation, fieldName, orderGid, tags, shopDomain) {
+  const normalizedShop = normalizeShopDomain(shopDomain || config.shopify.shopDomain);
+  const accessToken = shopifyAccessToken(normalizedShop);
+  if (!accessToken) {
+    throw new Error(`Chua co Shopify access token cho shop ${normalizedShop}.`);
+  }
+
+  const uniqueTags = uniqueStrings(tags).filter(Boolean);
+  if (!uniqueTags.length) {
+    return null;
+  }
+
+  const response = await shopifyGraphql(
+    mutation,
+    { id: orderGid, tags: uniqueTags },
+    normalizedShop,
+    accessToken
+  );
+
+  const userErrors = response.data?.[fieldName]?.userErrors || [];
+  if (userErrors.length) {
+    throw new Error(`Shopify khong cap nhat duoc tag: ${userErrors.map((error) => error.message).join('; ')}`);
+  }
+
+  return response.data?.[fieldName]?.node || null;
+}
+
 async function registerShopifyWebhooks(shopDomain, accessToken) {
   const baseUrl = config.shopify.publicAppUrl.replace(/\/+$/, '');
   const targets = [
-    { topic: 'ORDERS_PAID', uri: `${baseUrl}/webhooks/shopify/orders-paid` }
+    { topic: 'ORDERS_PAID', uri: `${baseUrl}/webhooks/shopify/orders-paid` },
+    { topic: 'ORDERS_CANCELLED', uri: `${baseUrl}/webhooks/shopify/orders-cancelled` }
   ];
 
   if (config.cod.enabled) {
@@ -1101,6 +1377,143 @@ function clientOrderCode(order) {
   return code || `order-${Date.now()}`;
 }
 
+function shopifyOrderInfo(order) {
+  const orderName = order.name || String(order.order_number || order.id || 'unknown');
+  const orderGid = order.admin_graphql_api_id || (order.id ? `gid://shopify/Order/${order.id}` : '');
+  return {
+    orderGid,
+    orderName,
+    orderId: order.id ? String(order.id) : '',
+    clientOrderCode: clientOrderCode(order),
+    cancelledAt: order.cancelled_at || order.cancelledAt || '',
+    cancelReason: order.cancel_reason || order.cancelReason || ''
+  };
+}
+
+function findProcessedByShopifyOrder(processed, info) {
+  if (info.orderGid && processed[info.orderGid]) {
+    return { orderKey: info.orderGid, record: processed[info.orderGid] };
+  }
+
+  const candidates = [
+    info.orderName,
+    info.orderId,
+    info.clientOrderCode
+  ].map(normalizeExternalCode).filter(Boolean);
+
+  for (const [orderKey, record] of Object.entries(processed)) {
+    const recordCandidates = [
+      orderKey,
+      record.orderName,
+      record.clientOrderCode,
+      record.shopifyOrderId
+    ].map(normalizeExternalCode).filter(Boolean);
+
+    if (recordCandidates.some((value) => candidates.includes(value))) {
+      return { orderKey, record };
+    }
+  }
+
+  return null;
+}
+
+function findProcessedByGhnOrder(processed, event) {
+  const orderCode = normalizeExternalCode(event.orderCode);
+  const clientOrderCode = normalizeExternalCode(event.clientOrderCode);
+
+  for (const [orderKey, record] of Object.entries(processed)) {
+    if (orderCode && normalizeExternalCode(record.ghnOrderCode) === orderCode) {
+      return { orderKey, record };
+    }
+
+    if (clientOrderCode && normalizeExternalCode(record.clientOrderCode) === clientOrderCode) {
+      return { orderKey, record };
+    }
+  }
+
+  return null;
+}
+
+function normalizeGhnStatusEvent(body) {
+  const data = body && typeof body.data === 'object' && !Array.isArray(body.data) ? body.data : {};
+  const orderCode = firstString(
+    body?.order_code,
+    body?.orderCode,
+    body?.OrderCode,
+    data.order_code,
+    data.orderCode,
+    data.OrderCode
+  );
+  const clientOrderCode = firstString(
+    body?.client_order_code,
+    body?.clientOrderCode,
+    body?.ClientOrderCode,
+    data.client_order_code,
+    data.clientOrderCode,
+    data.ClientOrderCode
+  );
+  const status = normalizeGhnStatus(firstString(
+    body?.status,
+    body?.Status,
+    body?.order_status,
+    body?.OrderStatus,
+    data.status,
+    data.Status,
+    data.order_status,
+    data.OrderStatus
+  ));
+
+  if (!orderCode && !clientOrderCode) {
+    throw permanentError('Webhook GHN thieu ma van don hoac ma don doi tac.');
+  }
+
+  if (!status) {
+    throw permanentError('Webhook GHN thieu trang thai don hang.');
+  }
+
+  return {
+    orderCode,
+    clientOrderCode,
+    status,
+    statusLabel: ghnStatusLabel(status),
+    reason: firstString(body?.reason, body?.Reason, data.reason, data.Reason),
+    raw: body
+  };
+}
+
+function firstString(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return '';
+}
+
+function normalizeGhnStatus(value) {
+  return normalizeText(value).replace(/\s+/g, '_');
+}
+
+function ghnStatusTag(status) {
+  return `${GHN_STATUS_TAG_PREFIX}${ghnStatusLabel(status)}`;
+}
+
+function ghnStatusLabel(status) {
+  return GHN_STATUS_LABELS[status] || humanizeStatus(status);
+}
+
+function humanizeStatus(status) {
+  return String(status || '')
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ') || 'Cap nhat trang thai';
+}
+
+function normalizeExternalCode(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
 function moneyToVnd(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : 0;
@@ -1132,6 +1545,29 @@ function verifyShopifyWebhook(rawBody, headers) {
   if (left.length !== right.length || !crypto.timingSafeEqual(left, right)) {
     throw new Error('Chu ky webhook Shopify khong hop le.');
   }
+}
+
+function verifyGhnWebhook(url, headers) {
+  const secret = config.ghn.webhookSecret;
+  if (!secret) return;
+
+  const authHeader = String(headers.authorization || '');
+  const bearer = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
+  const provided = firstString(
+    url.searchParams.get('secret'),
+    headers['x-ghn-webhook-secret'],
+    bearer
+  );
+
+  if (!provided || !safeEqual(provided, secret)) {
+    throw new Error('Chu ky webhook GHN khong hop le.');
+  }
+}
+
+function safeEqual(leftValue, rightValue) {
+  const left = Buffer.from(String(leftValue));
+  const right = Buffer.from(String(rightValue));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
 function verifyShopifyOauthHmac(searchParams) {
