@@ -1,14 +1,16 @@
 {
-  "name": "card-clash-online",
+  "name": "jforce-ghn-shopify-bridge",
   "version": "1.0.0",
   "private": true,
-  "description": "CARD CLASH online PvP memory battle with random matchmaking.",
-  "main": "server.js",
+  "type": "commonjs",
+  "description": "Create GHN shipments from paid Shopify orders and update Shopify tracking.",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js && node --check scripts/register-webhook.js",
+    "register-webhook": "node scripts/register-webhook.js"
   },
-  "dependencies": {
-    "express": "^4.19.2",
-    "socket.io": "^4.7.5"
+  "engines": {
+    "node": ">=20"
   }
 }
+
