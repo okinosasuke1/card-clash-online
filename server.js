@@ -12,7 +12,9 @@ const PROCESSED_FILE = path.join(DATA_DIR, 'processed-orders.json');
 const FAILED_FILE = path.join(DATA_DIR, 'failed-orders.json');
 const INSTALLATIONS_FILE = path.join(DATA_DIR, 'shopify-installations.json');
 const OAUTH_STATES_FILE = path.join(DATA_DIR, 'oauth-states.json');
+const ADDRESS_ALIASES_FILE = path.join(DATA_DIR, 'address-aliases.json');
 const FETCH_TIMEOUT_MS = numberEnv('FETCH_TIMEOUT_MS', 20000);
+const MASTER_DATA_CACHE_TTL_MS = numberEnv('GHN_MASTER_DATA_CACHE_TTL_MS', 12 * 60 * 60 * 1000);
 
 const ORDER_FULFILLMENT_QUERY = `
 query OrderFulfillmentOrders($id: ID!) {
@@ -112,7 +114,37 @@ const config = {
       'thanh toán khi nhận hàng',
       'thanh toan khi nhan hang'
     ])
+  },
+  address: {
+    aliasesJson: env('ADDRESS_ALIASES_JSON')
   }
+};
+
+const masterDataCache = new Map();
+
+const BUILT_IN_ADDRESS_ALIASES = {
+  provinces: [
+    {
+      aliases: ['tp hcm', 'tphcm', 'hcm', 'ho chi minh city', 'sai gon', 'saigon'],
+      target: 'Ho Chi Minh'
+    }
+  ],
+  districts: [
+    {
+      aliases: ['q binh thanh', 'quan binh thanh', 'binh thanh district'],
+      target: 'Binh Thanh',
+      whenAny: ['ho chi minh', 'hcm', 'sai gon', 'saigon']
+    }
+  ],
+  wards: [
+    {
+      aliases: ['p22', 'p 22', 'phuong 22', 'ward 22'],
+      target: 'Phuong 22',
+      district: 'Binh Thanh',
+      province: 'Ho Chi Minh',
+      whenAny: ['ho chi minh', 'hcm', 'sai gon', 'saigon']
+    }
+  ]
 };
 
 const server = http.createServer(async (req, res) => {
@@ -448,58 +480,85 @@ function calculateCodAmount(order) {
   );
 }
 
+async function getGhnProvinces() {
+  return cachedGhnMasterData('province', '/shiip/public-api/master-data/province', { method: 'GET' });
+}
+
+async function getGhnDistricts(provinceId) {
+  return cachedGhnMasterData(`district:${provinceId}`, '/shiip/public-api/master-data/district', {
+    method: 'GET',
+    query: { province_id: provinceId }
+  });
+}
+
+async function getGhnWards(districtId) {
+  return cachedGhnMasterData(`ward:${districtId}`, '/shiip/public-api/master-data/ward', {
+    method: 'GET',
+    query: { district_id: districtId }
+  });
+}
+
+async function cachedGhnMasterData(cacheKey, apiPath, options) {
+  const cached = masterDataCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < MASTER_DATA_CACHE_TTL_MS) {
+    return cached.value;
+  }
+
+  const value = await ghnRequest(apiPath, options);
+  masterDataCache.set(cacheKey, { at: Date.now(), value });
+  return value;
+}
+
 async function resolveRecipientAddress(shippingAddress) {
   const country = shippingAddress.country_code || shippingAddress.countryCode || shippingAddress.country;
   if (country && !['VN', 'VIETNAM', 'VIET NAM', 'VIET NAM'].includes(normalizeText(country).toUpperCase())) {
     throw permanentError('GHN chi ho tro don giao trong Viet Nam.');
   }
 
-  const candidates = addressCandidates(shippingAddress);
-  const provinces = await ghnRequest('/shiip/public-api/master-data/province', { method: 'GET' });
+  const candidates = expandAddressCandidates(addressCandidates(shippingAddress));
+  const provinces = await getGhnProvinces();
   const province = findBestMatch(provinces.data || [], 'ProvinceName', candidates, 'province');
   if (!province) {
+    const inferred = await findAddressAcrossProvinces(provinces.data || [], candidates);
+    if (inferred) return formatResolvedAddress(inferred.province, inferred.district, inferred.ward);
     throw permanentError(`Khong tim duoc tinh/thanh GHN tu dia chi: ${candidates.join(' | ')}`);
   }
 
-  const districts = await ghnRequest('/shiip/public-api/master-data/district', {
-    method: 'GET',
-    query: { province_id: province.ProvinceID }
-  });
+  const districts = await getGhnDistricts(province.ProvinceID);
   const district = findBestMatch(districts.data || [], 'DistrictName', candidates, 'district');
   if (district) {
     const resolved = await resolveWardForDistrict(district, candidates);
     if (resolved) {
-      return {
-        provinceId: province.ProvinceID,
-        provinceName: province.ProvinceName,
-        districtId: resolved.district.DistrictID,
-        districtName: resolved.district.DistrictName,
-        wardCode: String(resolved.ward.WardCode),
-        wardName: resolved.ward.WardName
-      };
+      return formatResolvedAddress(province, resolved.district, resolved.ward);
     }
   }
 
   const inferred = await findWardAcrossDistricts(districts.data || [], candidates);
-  if (!inferred) {
+  if (inferred) {
+    return formatResolvedAddress(province, inferred.district, inferred.ward);
+  }
+
+  const inferredProvince = await findAddressAcrossProvinces(provinces.data || [], candidates, province.ProvinceID);
+  if (!inferredProvince) {
     throw permanentError(`Khong tim duoc quan/phuong GHN tu dia chi, hay them quan/huyen vao dia chi: ${candidates.join(' | ')}`);
   }
 
+  return formatResolvedAddress(inferredProvince.province, inferredProvince.district, inferredProvince.ward);
+}
+
+function formatResolvedAddress(province, district, ward) {
   return {
     provinceId: province.ProvinceID,
     provinceName: province.ProvinceName,
-    districtId: inferred.district.DistrictID,
-    districtName: inferred.district.DistrictName,
-    wardCode: String(inferred.ward.WardCode),
-    wardName: inferred.ward.WardName
+    districtId: district.DistrictID,
+    districtName: district.DistrictName,
+    wardCode: String(ward.WardCode),
+    wardName: ward.WardName
   };
 }
 
 async function resolveWardForDistrict(district, candidates) {
-  const wards = await ghnRequest('/shiip/public-api/master-data/ward', {
-    method: 'GET',
-    query: { district_id: district.DistrictID }
-  });
+  const wards = await getGhnWards(district.DistrictID);
   const ward = findBestMatch(wards.data || [], 'WardName', candidates, 'ward');
   return ward ? { district, ward } : null;
 }
@@ -508,13 +567,50 @@ async function findWardAcrossDistricts(districts, candidates) {
   const matches = [];
 
   for (const district of districts) {
-    const wards = await ghnRequest('/shiip/public-api/master-data/ward', {
-      method: 'GET',
-      query: { district_id: district.DistrictID }
-    });
+    const wards = await getGhnWards(district.DistrictID);
     const match = findBestMatchWithScore(wards.data || [], 'WardName', candidates, 'ward');
     if (match.best && match.bestScore >= 80) {
       matches.push({ district, ward: match.best, score: match.bestScore });
+    }
+  }
+
+  matches.sort((a, b) => b.score - a.score);
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1 && matches[0].score > matches[1].score) return matches[0];
+  return null;
+}
+
+async function findAddressAcrossProvinces(provinces, candidates, excludedProvinceId) {
+  const matches = [];
+
+  for (const province of provinces) {
+    if (excludedProvinceId && Number(province.ProvinceID) === Number(excludedProvinceId)) {
+      continue;
+    }
+
+    const districts = await getGhnDistricts(province.ProvinceID);
+    const districtMatch = findBestMatchWithScore(districts.data || [], 'DistrictName', candidates, 'district');
+    if (districtMatch.best) {
+      const resolved = await resolveWardForDistrict(districtMatch.best, candidates);
+      if (resolved) {
+        matches.push({
+          province,
+          district: resolved.district,
+          ward: resolved.ward,
+          score: districtMatch.bestScore + 20
+        });
+        continue;
+      }
+    }
+
+    const inferred = await findWardAcrossDistricts(districts.data || [], candidates);
+    if (inferred) {
+      matches.push({
+        province,
+        district: inferred.district,
+        ward: inferred.ward,
+        score: inferred.score
+      });
     }
   }
 
@@ -848,7 +944,7 @@ function stripAdminWords(value) {
 
 function addressCandidates(address) {
   const formatted = Array.isArray(address.formatted) ? address.formatted.join(', ') : '';
-  return [
+  const raw = [
     address.address1,
     address.address2,
     address.city,
@@ -858,12 +954,129 @@ function addressCandidates(address) {
     formatted,
     joinAddress(address)
   ].filter(Boolean);
+
+  const split = raw.flatMap(splitAddressCandidate);
+  return uniqueStrings([...raw, ...split]);
+}
+
+function splitAddressCandidate(value) {
+  return String(value || '')
+    .split(/[,;\n|]+/g)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function expandAddressCandidates(candidates) {
+  const expanded = new Set(candidates.filter(Boolean));
+  const normalizedCandidates = candidates.map(normalizeText).filter(Boolean);
+
+  for (const rule of addressAliasRules()) {
+    if (!addressAliasRuleMatches(rule, normalizedCandidates)) continue;
+
+    for (const value of [rule.target, rule.province, rule.district, rule.ward]) {
+      if (value) expanded.add(value);
+    }
+
+    if (rule.ward && rule.district) expanded.add(`${rule.ward}, ${rule.district}`);
+    if (rule.district && rule.province) expanded.add(`${rule.district}, ${rule.province}`);
+    if (rule.ward && rule.district && rule.province) {
+      expanded.add(`${rule.ward}, ${rule.district}, ${rule.province}`);
+    }
+  }
+
+  return uniqueStrings([...expanded]);
+}
+
+function addressAliasRules() {
+  const configs = [BUILT_IN_ADDRESS_ALIASES, loadAddressAliasesFromEnv(), loadJson(ADDRESS_ALIASES_FILE, {})];
+  return configs.flatMap(normalizeAddressAliasConfig);
+}
+
+function loadAddressAliasesFromEnv() {
+  if (!config.address.aliasesJson) return {};
+  try {
+    return JSON.parse(config.address.aliasesJson);
+  } catch (error) {
+    console.error(`${new Date().toISOString()} ADDRESS_ALIASES_JSON invalid: ${error.message}`);
+    return {};
+  }
+}
+
+function normalizeAddressAliasConfig(configValue) {
+  if (!configValue) return [];
+  if (Array.isArray(configValue)) return configValue.map(normalizeAddressAliasRule).filter(Boolean);
+
+  return [
+    ...aliasGroup(configValue.provinces, 'province'),
+    ...aliasGroup(configValue.districts, 'district'),
+    ...aliasGroup(configValue.wards, 'ward')
+  ];
+}
+
+function aliasGroup(rules, level) {
+  if (!Array.isArray(rules)) return [];
+  return rules.map((rule) => normalizeAddressAliasRule({ ...rule, level })).filter(Boolean);
+}
+
+function normalizeAddressAliasRule(rule) {
+  const aliases = [rule.alias, ...(rule.aliases || []), ...(rule.from || [])]
+    .filter(Boolean)
+    .map(normalizeText)
+    .filter(Boolean);
+  const target = rule.target || rule.to || rule.name || rule.ward || rule.district || rule.province;
+
+  if (!aliases.length || !target) return null;
+
+  const normalized = {
+    aliases,
+    target,
+    level: rule.level || 'ward',
+    province: rule.province || '',
+    district: rule.district || '',
+    ward: rule.ward || '',
+    whenAny: normalizeStringList(rule.whenAny),
+    whenAll: normalizeStringList(rule.whenAll)
+  };
+
+  if (normalized.level === 'province') normalized.province = normalized.target;
+  if (normalized.level === 'district') normalized.district = normalized.target;
+  if (normalized.level === 'ward') normalized.ward = normalized.target;
+  return normalized;
+}
+
+function addressAliasRuleMatches(rule, normalizedCandidates) {
+  const haystack = normalizedCandidates.join(' | ');
+  if (!rule.aliases.some((alias) => haystack.includes(alias))) return false;
+  if (rule.whenAny.length && !rule.whenAny.some((item) => haystack.includes(item))) return false;
+  if (rule.whenAll.length && !rule.whenAll.every((item) => haystack.includes(item))) return false;
+  return true;
+}
+
+function normalizeStringList(value) {
+  if (!value) return [];
+  const items = Array.isArray(value) ? value : [value];
+  return items.map(normalizeText).filter(Boolean);
+}
+
+function uniqueStrings(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const text = String(value || '').trim();
+    const key = normalizeText(text);
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+  }
+  return result;
 }
 
 function normalizeText(value) {
   return String(value || '')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
     .replace(/đ/g, 'd')
     .replace(/Đ/g, 'D')
     .toLowerCase()
